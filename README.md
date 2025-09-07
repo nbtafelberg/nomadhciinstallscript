@@ -28,3 +28,5 @@ Enjoy
 
 Wolf Software Systems Ltd
 https://wolf.uk.com
+
+USE AT YOUR OWN RISK
