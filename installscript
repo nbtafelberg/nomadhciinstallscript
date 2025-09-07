@@ -1,0 +1,274 @@
+#!/bin/bash
+# Open source, use it fix it and send us a copy for idfferent configs
+# hopefully we can buld a library of these scripts for different use cases
+# 
+# this was really painful
+#
+# Wolf Software Systems Ltd https://wolf.uk.com
+# Built by Paul Clevett with blood sweat and tears
+# one day life will be easier
+
+
+# SECURE Nomad, Consul, and Docker Cluster Installation Script
+# GOAL: Combine the stable Nomad configuration with the Nginx security layer.
+# This script should be run on ALL THREE of your servers.
+#
+# !! IMPORTANT !! For this script to succeed, you MUST allow incoming traffic
+# on TCP port 80 & 443 in your cloud provider's firewall for all public server IPs.
+#
+
+set -e # Exit immediately if a command exits with a non-zero status.
+
+# --- SCRIPT CONFIGURATION ---
+# --------------------------------------------------------------------------
+
+# An array of the PRIVATE IP addresses for each server in the cluster.
+SERVER_IPS=(
+    "-- change local ip 1 --"
+    "-- change local ip 2 --"
+    "-- change local ip 3 --"
+)
+
+# An array of the PUBLIC IP addresses for each server, in the same order.
+PUBLIC_SERVER_IPS=(
+    "-- change public ip 1 --"
+    "-- change public ip 2 --"
+    "-- change public ip 3 --"
+)
+
+# An array of the FQDNs (domains) for each server, in the same order as the IPs. - this will be used to name the nodes as well
+SERVER_DOMAINS=(
+    "-- domain 1 --"
+    "-- domain 2 --"
+    "-- domain 3 --"
+)
+
+# The name of the private network interface to bind services to (e.g., enp8s0.4000). - this is set up for a hetzner vswitch in fact
+PRIVATE_INTERFACE="-- change to your private network interface for your PRIVATE network --"
+
+# --- Nginx UI Authentication ---
+# Set the username and password you want to use to protect the Nomad Web UI.
+NGINX_AUTH_USER="-- create username --"
+NGINX_AUTH_PASSWORD="-- create password --"
+
+# --- END OF CONFIGURATION ---
+
+
+# --- SCRIPT LOGIC ---
+
+# Helper function to stop and clean up previous installations
+cleanup_previous_install() {
+    echo ">>> Cleaning up any previous installations..."
+    systemctl stop nomad || true
+    systemctl stop consul || true
+    systemctl stop nginx || true
+    systemctl disable nginx || true
+
+    rm -rf /opt/nomad/*
+    rm -rf /opt/consul/*
+
+    # Remove old service files as they might be malformed
+    rm -f /etc/systemd/system/nomad.service
+    rm -f /etc/systemd/system/consul.service
+
+    rm -f /etc/nomad.d/nomad.hcl
+    rm -f /etc/consul.d/consul.hcl
+    rm -f /etc/nginx/sites-enabled/nomad-ui
+    rm -f /etc/nginx/sites-available/nomad-ui
+    rm -f /etc/nginx/.htpasswd
+    echo ">>> Cleanup complete."
+}
+
+
+echo ">>> Starting WOLFY SECURE Nomad, Consul, and Docker Cluster Setup..."
+
+# Run the cleanup function first
+cleanup_previous_install
+
+# 0. Prequisite Installation
+echo ">>> Installing prerequisite packages..."
+apt-get update
+# Add nginx, apache2-utils, and certbot
+apt-get install -y curl unzip gpg ca-certificates nginx apache2-utils certbot
+
+# 1. Helper functions
+install_hashicorp_product() {
+    local product=$1
+    local version=$2
+    local arch="amd64"
+    if command -v $product &> /dev/null; then return; fi
+    echo ">>> Installing $product version $version..."
+    local url="https://releases.hashicorp.com/${product}/${version}/${product}_${version}_linux_${arch}.zip"
+    curl -sSL -o /tmp/${product}.zip $url
+    unzip -o /tmp/${product}.zip -d /usr/local/bin/
+    rm /tmp/${product}.zip
+    chmod +x /usr/local/bin/${product}
+}
+
+install_docker() {
+    if command -v docker &> /dev/null; then return; fi
+    echo ">>> Installing Docker..."
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable docker.service
+    systemctl start docker.service
+}
+
+# 2. Detect IPs and Domain
+CURRENT_SERVER_IP=$(ip -4 addr show $PRIVATE_INTERFACE | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+CURRENT_PUBLIC_IP=""
+CURRENT_DOMAIN=""
+for i in "${!SERVER_IPS[@]}"; do
+    if [ "$CURRENT_SERVER_IP" = "${SERVER_IPS[$i]}" ]; then
+        CURRENT_PUBLIC_IP="${PUBLIC_SERVER_IPS[$i]}"
+        CURRENT_DOMAIN="${SERVER_DOMAINS[$i]}"
+        break
+    fi
+done
+
+# 3. Install Binaries
+install_hashicorp_product "nomad" "1.8.0"
+install_hashicorp_product "consul" "1.19.0"
+install_docker
+
+# 4. Generate TLS Certificates
+echo ">>> Generating TLS certificate for ${CURRENT_DOMAIN}..."
+# Stop nginx temporarily if it's running to free up port 80 for certbot
+if systemctl is-active --quiet nginx; then systemctl stop nginx; fi
+certbot certonly --standalone -d "$CURRENT_DOMAIN" --email "paul@wolf.uk.com" --agree-tos --non-interactive --http-01-port 80
+TLS_CERT_FILE="/etc/letsencrypt/live/$CURRENT_DOMAIN/fullchain.pem"
+TLS_KEY_FILE="/etc/letsencrypt/live/$CURRENT_DOMAIN/privkey.pem"
+
+# 5. Configure Nginx Proxy
+echo ">>> Configuring Nginx as a secure reverse proxy..."
+htpasswd -cb /etc/nginx/.htpasswd "$NGINX_AUTH_USER" "$NGINX_AUTH_PASSWORD"
+cat << EOF > /etc/nginx/sites-available/nomad-ui
+server {
+    listen 80;
+    server_name ${CURRENT_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name ${CURRENT_DOMAIN};
+    ssl_certificate ${TLS_CERT_FILE};
+    ssl_certificate_key ${TLS_KEY_FILE};
+    location / {
+        auth_basic "Nomad UI - Restricted Access";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        proxy_pass http://127.0.0.1:4646;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade \$http_upgrade;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/nomad-ui /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl enable nginx
+systemctl start nginx
+
+# 6. Create Configuration Directories and Files
+mkdir -p /etc/nomad.d; chmod 700 /etc/nomad.d
+mkdir -p /etc/consul.d; chmod 700 /etc/consul.d
+
+JOIN_STRING=$(printf '"%s",' "${SERVER_IPS[@]}"); JOIN_STRING=${JOIN_STRING%,}
+
+cat << EOF > /etc/consul.d/consul.hcl
+data_dir  = "/opt/consul"
+log_level = "INFO"
+server = true
+retry_join = [${JOIN_STRING}]
+bootstrap_expect = 3
+bind_addr   = "0.0.0.0"
+advertise_addr = "$CURRENT_SERVER_IP"
+ui_config { enabled = true }
+client_addr = "0.0.0.0"
+EOF
+
+# **FIX**: Reverted to the simpler, stable bind_addr configuration for Nomad.
+cat << EOF > /etc/nomad.d/nomad.hcl
+data_dir  = "/opt/nomad"
+log_level = "INFO"
+name = "${CURRENT_DOMAIN}"
+
+# Listen on all interfaces for all services.
+# This is the stable configuration that worked previously.
+# Nginx provides security by proxying to the UI port.
+bind_addr = "0.0.0.0"
+
+server {
+  enabled          = true
+  bootstrap_expect = 3
+  server_join {
+    retry_join = [${JOIN_STRING}]
+  }
+}
+client { enabled = true }
+plugin "docker" { config { allow_privileged = true } }
+advertise {
+  http = "${CURRENT_PUBLIC_IP}:4646"
+  rpc  = "${CURRENT_SERVER_IP}:4647"
+  serf = "${CURRENT_SERVER_IP}:4648"
+}
+consul { address = "127.0.0.1:8500" }
+EOF
+
+# 7. Create and Start systemd Services
+echo ">>> Creating systemd service files with corrected syntax..."
+cat << EOF > /etc/systemd/system/consul.service
+[Unit]
+Description="HashiCorp Consul"
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d/
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat << EOF > /etc/systemd/system/nomad.service
+[Unit]
+Description="Nomad"
+Wants=network-online.target consul.service
+After=network-online.target consul.service
+
+[Service]
+ExecStart=/usr/local/bin/nomad agent -config=/etc/nomad.d
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable consul.service
+systemctl enable nomad.service
+systemctl start consul.service
+systemctl start nomad.service
+
+echo ">>> Waiting 20 seconds for the cluster to form..."
+sleep 20
+
+# 8. Final Status Check
+echo "--- INSTALLATION COMPLETE ---"
+echo "Your cluster should now be operational and secure."
+echo "Check the status with the CLI (run this on a cluster node):"
+echo "  export NOMAD_ADDR=http://127.0.0.1:4646"
+echo "  nomad server members"
+echo ""
+echo "Access the SECURE Web UI at: https://${CURRENT_DOMAIN}"
+echo "Access the Consul UI at: http://${CURRENT_DOMAIN}:8500"
+
