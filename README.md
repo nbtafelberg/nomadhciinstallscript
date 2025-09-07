@@ -1,4 +1,5 @@
-Nomad Install Script
+#Nomad Install Script
+
 - install Nomad, Nginx, Docker, Consul on a 3 node cluster (just add more if you want more nodes)
 - set up DNS entries to your public ip's of the nodes
 - change the file before running it on each node
